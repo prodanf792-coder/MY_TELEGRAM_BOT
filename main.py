@@ -13,8 +13,8 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN8970288617:AAFqo1AYCSrjkNeBAfX2Hamo8ISMsXTWunA
+ADMIN_ID = int(os.getenv("ADMIN_ID7746782985))
 REFERRAL_REWARD = float(os.getenv("REFERRAL_REWARD", "0.05"))
 MIN_WITHDRAW = float(os.getenv("MIN_WITHDRAW", "5"))
 DB_NAME = "referral_bot.db"
