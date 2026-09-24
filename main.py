@@ -1,721 +1,1295 @@
 import os
-import telebot
-import psycopg2
-from telebot import types
-from decimal import Decimal
+import sqlite3
+import logging
+from datetime import datetime
 
-=========================
-
-SETTINGS
-
-=========================
-
-TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-ADMIN_ID = 7746782985
-
-REFERRAL_REWARD = Decimal("0.05")
-TASK_REWARD = Decimal("0.05")
-MIN_WITHDRAW = Decimal("3.00")
-
-bot = telebot.TeleBot(TOKEN)
-
-=========================
-
-DATABASE
-
-=========================
-
-def get_db_connection():
-return psycopg2.connect(
-DATABASE_URL,
-sslmode="require"
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+REFERRAL_REWARD = float(os.getenv("REFERRAL_REWARD", "0.05"))
+MIN_WITHDRAW = float(os.getenv("MIN_WITHDRAW", "5"))
+
+DB_NAME = "referral_bot.db"
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing!")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+# Withdrawal conversation states
+WD_AMOUNT, WD_METHOD, WD_ACCOUNT = range(3)
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+def db():
+    return sqlite3.connect(DB_NAME)
+
 
 def init_db():
-conn = get_db_connection()
-cursor = conn.cursor()
+    con = db()
+    cur = con.cursor()
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id BIGINT PRIMARY KEY,
-        username TEXT,
-        balance NUMERIC(12, 2) DEFAULT 0,
-        referred_by BIGINT,
-        referral_count INT DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            balance REAL DEFAULT 0,
+            referrals INTEGER DEFAULT 0,
+            referred_by INTEGER DEFAULT NULL,
+            joined_at TEXT
+        )
+    """)
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS tasks (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        reward NUMERIC(12, 2) DEFAULT 0.05,
-        link TEXT,
-        active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            method TEXT,
+            account TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT
+        )
+    """)
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS completed_tasks (
-        user_id BIGINT,
-        task_id INT,
-        completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (user_id, task_id)
-    )
-""")
+    con.commit()
+    con.close()
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS withdrawals (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        amount NUMERIC(12, 2),
-        method TEXT,
-        account TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
 
-conn.commit()
-cursor.close()
-conn.close()
+def get_user(user_id):
+    con = db()
+    cur = con.cursor()
 
-try:
-init_db()
-except Exception as e:
-print("Database Init Error:", e)
-
-=========================
-
-MAIN MENU
-
-=========================
-
-def main_menu():
-markup = types.ReplyKeyboardMarkup(
-row_width=2,
-resize_keyboard=True
-)
-
-markup.add(
-    types.KeyboardButton("📊 My Profile"),
-    types.KeyboardButton("🔗 Invite Link"),
-    types.KeyboardButton("📋 Tasks"),
-    types.KeyboardButton("💰 Balance"),
-    types.KeyboardButton("💸 Withdraw"),
-    types.KeyboardButton("🏆 Leaderboard")
-)
-
-return markup
-
-=========================
-
-START / REFERRAL
-
-=========================
-
-@bot.message_handler(commands=["start"])
-def start(message):
-
-user_id = message.from_user.id
-username = message.from_user.username or f"User_{user_id}"
-
-args = message.text.split()
-
-referrer_id = None
-
-if len(args) > 1:
-    try:
-        referrer_id = int(args[1])
-    except ValueError:
-        referrer_id = None
-
-try:
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT user_id FROM users WHERE user_id = %s",
+    cur.execute(
+        "SELECT * FROM users WHERE user_id=?",
         (user_id,)
     )
 
-    existing_user = cursor.fetchone()
+    row = cur.fetchone()
+    con.close()
+    return row
 
-    if not existing_user:
 
-        # Create user
-        cursor.execute("""
-            INSERT INTO users
-            (user_id, username, referred_by)
-            VALUES (%s, %s, %s)
+def create_user(user_id, username, first_name, referred_by=None):
+    con = db()
+    cur = con.cursor()
+
+    # Don't allow self-referral
+    if referred_by == user_id:
+        referred_by = None
+
+    cur.execute("""
+        INSERT INTO users
+        (user_id, username, first_name, balance, referrals,
+         referred_by, joined_at)
+        VALUES (?, ?, ?, 0, 0, ?, ?)
+    """, (
+        user_id,
+        username or "",
+        first_name or "",
+        referred_by,
+        datetime.now().isoformat()
+    ))
+
+    # Give referral reward
+    if referred_by:
+        cur.execute("""
+            UPDATE users
+            SET balance = balance + ?,
+                referrals = referrals + 1
+            WHERE user_id=?
         """, (
-            user_id,
-            username,
-            referrer_id if referrer_id != user_id else None
+            REFERRAL_REWARD,
+            referred_by
         ))
 
-        # Give referral reward
-        if referrer_id and referrer_id != user_id:
-
-            cursor.execute("""
-                UPDATE users
-                SET
-                    balance = balance + %s,
-                    referral_count = referral_count + 1
-                WHERE user_id = %s
-            """, (
-                REFERRAL_REWARD,
-                referrer_id
-            ))
-
-            try:
-                bot.send_message(
-                    referrer_id,
-                    f"🎉 নতুন referral!\n\n"
-                    f"💰 আপনি পেয়েছেন {REFERRAL_REWARD} USDT"
-                )
-            except Exception:
-                pass
-
-        conn.commit()
-
-    cursor.close()
-    conn.close()
-
-except Exception as e:
-    print("Start Error:", e)
-
-bot.send_message(
-    message.chat.id,
-    f"👋 স্বাগতম {username}!\n\n"
-    f"🎁 Referral করলে পাবেন {REFERRAL_REWARD} USDT\n"
-    f"📋 Task complete করলেও পাবেন {TASK_REWARD} USDT",
-    reply_markup=main_menu()
-)
-
-=========================
-
-PROFILE
-
-=========================
-
-@bot.message_handler(func=lambda message: message.text == "📊 My Profile")
-def profile(message):
-
-user_id = message.from_user.id
-
-conn = get_db_connection()
-cursor = conn.cursor()
-
-cursor.execute("""
-    SELECT username, balance, referral_count
-    FROM users
-    WHERE user_id = %s
-""", (user_id,))
-
-user = cursor.fetchone()
-
-cursor.close()
-conn.close()
-
-if not user:
-    bot.send_message(
-        message.chat.id,
-        "❌ আগে /start দিন।"
-    )
-    return
-
-username, balance, referral_count = user
-
-bot.send_message(
-    message.chat.id,
-    f"👤 Profile\n\n"
-    f"Username: @{username}\n"
-    f"💰 Balance: {balance} USDT\n"
-    f"👥 Referrals: {referral_count}"
-)
-
-=========================
-
-INVITE LINK
-
-=========================
-
-@bot.message_handler(func=lambda message: message.text == "🔗 Invite Link")
-def invite_link(message):
-
-user_id = message.from_user.id
-
-bot_info = bot.get_me()
-
-link = f"https://t.me/{bot_info.username}?start={user_id}"
-
-bot.send_message(
-    message.chat.id,
-    f"🔗 আপনার Referral Link:\n\n"
-    f"{link}\n\n"
-    f"👥 প্রতি successful referral = {REFERRAL_REWARD} USDT"
-)
-
-=========================
-
-BALANCE
-
-=========================
-
-@bot.message_handler(func=lambda message: message.text == "💰 Balance")
-def balance(message):
-
-user_id = message.from_user.id
-
-conn = get_db_connection()
-cursor = conn.cursor()
-
-cursor.execute(
-    "SELECT balance FROM users WHERE user_id = %s",
-    (user_id,)
-)
-
-result = cursor.fetchone()
-
-cursor.close()
-conn.close()
-
-balance_amount = result[0] if result else Decimal("0")
-
-bot.send_message(
-    message.chat.id,
-    f"💰 আপনার Balance:\n\n"
-    f"{balance_amount} USDT"
-)
-
-=========================
-
-LEADERBOARD
-
-=========================
-
-@bot.message_handler(func=lambda message: message.text == "🏆 Leaderboard")
-def leaderboard(message):
-
-conn = get_db_connection()
-cursor = conn.cursor()
-
-cursor.execute("""
-    SELECT username, referral_count
-    FROM users
-    ORDER BY referral_count DESC
-    LIMIT 10
-""")
-
-users = cursor.fetchall()
-
-cursor.close()
-conn.close()
-
-text = "🏆 Top Referrers\n\n"
-
-if not users:
-    text += "কোনো data নেই।"
-else:
-    for i, user in enumerate(users, 1):
-
-        username = user[0] or "Unknown"
-        referrals = user[1]
-
-        text += f"{i}. @{username} — {referrals} referrals\n"
-
-bot.send_message(
-    message.chat.id,
-    text
-)
-
-=========================
-
-TASK LIST
-
-=========================
-
-@bot.message_handler(func=lambda message: message.text == "📋 Tasks")
-def tasks(message):
-
-user_id = message.from_user.id
-
-conn = get_db_connection()
-cursor = conn.cursor()
-
-cursor.execute("""
-    SELECT id, title, reward, link
-    FROM tasks
-    WHERE active = TRUE
-    ORDER BY id DESC
-""")
-
-task_list = cursor.fetchall()
-
-cursor.close()
-conn.close()
-
-if not task_list:
-
-    bot.send_message(
-        message.chat.id,
-        "📋 এখন কোনো Task available নেই।"
-    )
-
-    return
-
-for task_id, title, reward, link in task_list:
-
-    markup = types.InlineKeyboardMarkup()
-
-    if link:
-        markup.add(
-            types.InlineKeyboardButton(
-                "🔗 Open Task",
-                url=link
+    con.commit()
+    con.close()
+
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔗 My Referral",
+                callback_data="referral"
+            ),
+            InlineKeyboardButton(
+                "💰 Balance",
+                callback_data="balance"
             )
+        ],
+        [
+            InlineKeyboardButton(
+                "👤 Profile",
+                callback_data="profile"
+            ),
+            InlineKeyboardButton(
+                "🏆 Leaderboard",
+                callback_data="leaderboard"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 Withdraw",
+                callback_data="withdraw"
+            ),
+            InlineKeyboardButton(
+                "ℹ️ Help",
+                callback_data="help"
+            )
+        ]
+    ])
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📊 Statistics",
+                callback_data="admin_stats"
+            ),
+            InlineKeyboardButton(
+                "💳 Withdrawals",
+                callback_data="admin_withdrawals"
+            )
+        ]
+    ])
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    if not get_user(user.id):
+
+        referred_by = None
+
+        if context.args:
+            try:
+                referred_by = int(context.args[0])
+            except ValueError:
+                referred_by = None
+
+        create_user(
+            user.id,
+            user.username,
+            user.first_name,
+            referred_by
         )
 
-    markup.add(
-        types.InlineKeyboardButton(
-            "✅ Claim",
-            callback_data=f"claim_{task_id}"
+    text = f"""
+╭━━━━━━━━━━━━━━━━━━━━╮
+       🚀 WELCOME
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+👋 Hello, {user.first_name}!
+
+🎁 Invite friends & earn USDT
+
+💎 Reward:
++{REFERRAL_REWARD:.2f} USDT / referral
+
+💳 Minimum Withdrawal:
+{MIN_WITHDRAW:.2f} USDT
+
+👇 Select an option below:
+"""
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard()
+    )
+
+
+# =========================================================
+# REFERRAL
+# =========================================================
+
+async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    me = await context.bot.get_me()
+
+    link = (
+        f"https://t.me/{me.username}"
+        f"?start={user.id}"
+    )
+
+    row = get_user(user.id)
+
+    referrals = row[4] if row else 0
+    balance = float(row[3]) if row else 0
+
+    text = f"""
+╭━━━━━━━━━━━━━━━━━━━━╮
+       🔗 YOUR REFERRAL
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+🎁 Invite friends & earn USDT!
+
+🔗 Your Referral Link:
+
+{link}
+
+👥 Referrals: {referrals}
+💰 Balance: {balance:.2f} USDT
+
+💎 Reward:
++{REFERRAL_REWARD:.2f} USDT / referral
+
+🚀 Share your link and earn!
+"""
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard()
+    )
+
+
+# =========================================================
+# BALANCE
+# =========================================================
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+    row = get_user(user.id)
+
+    amount = float(row[3]) if row else 0
+    referrals = row[4] if row else 0
+
+    await update.message.reply_text(
+        f"""
+╭━━━━━━━━━━━━━━━━━━━━╮
+        💰 BALANCE
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+💵 Balance:
+{amount:.2f} USDT
+
+👥 Referrals:
+{referrals}
+
+🎁 Per Referral:
+{REFERRAL_REWARD:.2f} USDT
+
+📌 Minimum Withdrawal:
+{MIN_WITHDRAW:.2f} USDT
+""",
+        reply_markup=main_keyboard()
+    )
+
+
+# =========================================================
+# PROFILE
+# =========================================================
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+    row = get_user(user.id)
+
+    balance_amount = float(row[3]) if row else 0
+    referrals = row[4] if row else 0
+
+    await update.message.reply_text(
+        f"""
+╭━━━━━━━━━━━━━━━━━━━━╮
+        👤 PROFILE
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+🆔 ID:
+{user.id}
+
+👤 Name:
+{user.first_name}
+
+🔖 Username:
+@{user.username or "N/A"}
+
+👥 Referrals:
+{referrals}
+
+💰 Balance:
+{balance_amount:.2f} USDT
+""",
+        reply_markup=main_keyboard()
+    )
+
+
+# =========================================================
+# LEADERBOARD
+# =========================================================
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT first_name, referrals
+        FROM users
+        ORDER BY referrals DESC
+        LIMIT 10
+    """)
+
+    rows = cur.fetchall()
+    con.close()
+
+    text = """
+╭━━━━━━━━━━━━━━━━━━━━╮
+       🏆 LEADERBOARD
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+"""
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    if not rows:
+        text += "No users yet."
+
+    for i, row in enumerate(rows):
+
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+
+        text += (
+            f"{prefix} {row[0]} — "
+            f"{row[1]} referrals\n"
         )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard()
     )
 
-    bot.send_message(
-        message.chat.id,
-        f"📋 {title}\n\n"
-        f"💰 Reward: {reward} USDT",
-        reply_markup=markup
+
+# =========================================================
+# HELP
+# =========================================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        f"""
+╭━━━━━━━━━━━━━━━━━━━━╮
+          ℹ️ HELP
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+/start
+/referral
+/balance
+/profile
+/leaderboard
+/withdraw
+
+🎁 Referral Reward:
+{REFERRAL_REWARD:.2f} USDT
+
+💳 Minimum Withdrawal:
+{MIN_WITHDRAW:.2f} USDT
+
+💳 Withdrawal Methods:
+• bKash
+• Binance
+"""
     )
 
-=========================
 
-CLAIM TASK
+# =========================================================
+# WITHDRAW START
+# =========================================================
 
-=========================
+async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("claim_"))
-def claim_task(call):
+    user = update.effective_user
+    row = get_user(user.id)
 
-user_id = call.from_user.id
-task_id = int(call.data.split("_")[1])
+    balance_amount = float(row[3]) if row else 0
 
-conn = get_db_connection()
-cursor = conn.cursor()
+    if balance_amount < MIN_WITHDRAW:
 
-cursor.execute("""
-    SELECT id, reward
-    FROM tasks
-    WHERE id = %s AND active = TRUE
-""", (task_id,))
+        await update.message.reply_text(
+            f"""
+❌ WITHDRAWAL UNAVAILABLE
 
-task = cursor.fetchone()
+💰 Your Balance:
+{balance_amount:.2f} USDT
 
-if not task:
+📌 Minimum:
+{MIN_WITHDRAW:.2f} USDT
 
-    cursor.close()
-    conn.close()
+You need:
+{MIN_WITHDRAW - balance_amount:.2f} USDT more.
+"""
+        )
 
-    bot.answer_callback_query(
-        call.id,
-        "❌ Task পাওয়া যায়নি।",
-        show_alert=True
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"""
+💳 WITHDRAWAL
+
+💰 Available:
+{balance_amount:.2f} USDT
+
+📌 Minimum:
+{MIN_WITHDRAW:.2f} USDT
+
+Enter withdrawal amount:
+"""
     )
 
-    return
+    return WD_AMOUNT
 
-cursor.execute("""
-    SELECT user_id
-    FROM completed_tasks
-    WHERE user_id = %s AND task_id = %s
-""", (
-    user_id,
-    task_id
-))
 
-already_completed = cursor.fetchone()
+async def wd_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-if already_completed:
+    try:
+        amount = float(update.message.text.strip())
+    except ValueError:
 
-    cursor.close()
-    conn.close()
+        await update.message.reply_text(
+            "❌ Enter a valid number."
+        )
 
-    bot.answer_callback_query(
-        call.id,
-        "⚠️ আপনি এই Task আগেই complete করেছেন।",
-        show_alert=True
+        return WD_AMOUNT
+
+    user = update.effective_user
+    row = get_user(user.id)
+
+    balance_amount = float(row[3]) if row else 0
+
+    if amount < MIN_WITHDRAW:
+
+        await update.message.reply_text(
+            f"❌ Minimum withdrawal is "
+            f"{MIN_WITHDRAW:.2f} USDT."
+        )
+
+        return WD_AMOUNT
+
+    if amount > balance_amount:
+
+        await update.message.reply_text(
+            f"""
+❌ Insufficient balance.
+
+Your balance:
+{balance_amount:.2f} USDT
+"""
+        )
+
+        return WD_AMOUNT
+
+    context.user_data["wd_amount"] = amount
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💳 bKash",
+                callback_data="wd_method_bkash"
+            ),
+            InlineKeyboardButton(
+                "🟡 Binance",
+                callback_data="wd_method_binance"
+            )
+        ]
+    ])
+
+    await update.message.reply_text(
+        "💳 Select withdrawal method:",
+        reply_markup=keyboard
     )
 
-    return
+    return WD_METHOD
 
-reward = task[1]
 
-cursor.execute("""
-    INSERT INTO completed_tasks
-    (user_id, task_id)
-    VALUES (%s, %s)
-""", (
-    user_id,
-    task_id
-))
+async def wd_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-cursor.execute("""
-    UPDATE users
-    SET balance = balance + %s
-    WHERE user_id = %s
-""", (
-    reward,
-    user_id
-))
+    query = update.callback_query
+    await query.answer()
 
-conn.commit()
-
-cursor.close()
-conn.close()
-
-bot.answer_callback_query(
-    call.id,
-    f"🎉 আপনি {reward} USDT পেয়েছেন!",
-    show_alert=True
-)
-
-=========================
-
-WITHDRAW
-
-=========================
-
-@bot.message_handler(func=lambda message: message.text == "💸 Withdraw")
-def withdraw_start(message):
-
-user_id = message.from_user.id
-
-conn = get_db_connection()
-cursor = conn.cursor()
-
-cursor.execute(
-    "SELECT balance FROM users WHERE user_id = %s",
-    (user_id,)
-)
-
-result = cursor.fetchone()
-
-cursor.close()
-conn.close()
-
-balance_amount = result[0] if result else Decimal("0")
-
-if balance_amount < MIN_WITHDRAW:
-
-    bot.send_message(
-        message.chat.id,
-        f"❌ Minimum withdrawal {MIN_WITHDRAW} USDT.\n\n"
-        f"আপনার বর্তমান balance: {balance_amount} USDT"
+    method = (
+        "bKash"
+        if query.data == "wd_method_bkash"
+        else "Binance"
     )
 
-    return
+    context.user_data["wd_method"] = method
 
-markup = types.InlineKeyboardMarkup()
+    await query.message.reply_text(
+        f"""
+💳 Method: {method}
 
-markup.add(
-    types.InlineKeyboardButton(
-        "📱 bKash",
-        callback_data="withdraw_bkash"
-    ),
-    types.InlineKeyboardButton(
-        "📱 Nagad",
-        callback_data="withdraw_nagad"
-    )
-)
-
-markup.add(
-    types.InlineKeyboardButton(
-        "💵 USDT BEP20",
-        callback_data="withdraw_bep20"
-    )
-)
-
-bot.send_message(
-    message.chat.id,
-    "💸 Withdrawal method নির্বাচন করুন:",
-    reply_markup=markup
-)
-
-=========================
-
-WITHDRAW METHOD
-
-=========================
-
-@bot.callback_query_handler(
-func=lambda call: call.data.startswith("withdraw_")
-)
-def withdraw_method(call):
-
-method = call.data.replace(
-    "withdraw_",
-    ""
-)
-
-if method == "bep20":
-    method_name = "USDT BEP20"
-
-elif method == "bkash":
-    method_name = "bKash"
-
-else:
-    method_name = "Nagad"
-
-bot.answer_callback_query(call.id)
-
-msg = bot.send_message(
-    call.message.chat.id,
-    f"💸 Method: {method_name}\n\n"
-    f"আপনার {method_name} number/address পাঠান:"
-)
-
-bot.register_next_step_handler(
-    msg,
-    process_withdraw,
-    method_name
-)
-
-=========================
-
-PROCESS WITHDRAW
-
-=========================
-
-def process_withdraw(message, method_name):
-
-user_id = message.from_user.id
-account = message.text.strip()
-
-conn = get_db_connection()
-cursor = conn.cursor()
-
-cursor.execute(
-    "SELECT balance FROM users WHERE user_id = %s",
-    (user_id,)
-)
-
-result = cursor.fetchone()
-
-if not result:
-
-    cursor.close()
-    conn.close()
-
-    bot.send_message(
-        message.chat.id,
-        "❌ User পাওয়া যায়নি।"
+📱 Enter your {method} number / UID:
+"""
     )
 
-    return
+    return WD_ACCOUNT
 
-balance_amount = result[0]
 
-if balance_amount < MIN_WITHDRAW:
+async def wd_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    cursor.close()
-    conn.close()
+    account = update.message.text.strip()
 
-    bot.send_message(
-        message.chat.id,
-        "❌ আপনার balance minimum withdrawal-এর নিচে।"
+    user = update.effective_user
+
+    amount = float(
+        context.user_data["wd_amount"]
     )
 
-    return
+    method = context.user_data["wd_method"]
 
-amount = balance_amount
+    row = get_user(user.id)
+    balance_amount = float(row[3]) if row else 0
 
-cursor.execute("""
-    INSERT INTO withdrawals
-    (user_id, amount, method, account)
-    VALUES (%s, %s, %s, %s)
-""", (
-    user_id,
-    amount,
-    method_name,
-    account
-))
+    if amount > balance_amount:
 
-# Reserve balance
-cursor.execute("""
-    UPDATE users
-    SET balance = 0
-    WHERE user_id = %s
-""", (user_id,))
+        await update.message.reply_text(
+            "❌ Insufficient balance."
+        )
 
-conn.commit()
+        return ConversationHandler.END
 
-cursor.close()
-conn.close()
+    con = db()
+    cur = con.cursor()
 
-bot.send_message(
-    message.chat.id,
-    f"✅ Withdrawal request submitted!\n\n"
-    f"💰 Amount: {amount} USDT\n"
-    f"💳 Method: {method_name}\n"
-    f"📌 Status: Pending"
-)
+    # Deduct balance
+    cur.execute("""
+        UPDATE users
+        SET balance = balance - ?
+        WHERE user_id=?
+    """, (
+        amount,
+        user.id
+    ))
 
-# Admin notification
-try:
+    # Create withdrawal
+    cur.execute("""
+        INSERT INTO withdrawals
+        (user_id, amount, method, account,
+         status, created_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)
+    """, (
+        user.id,
+        amount,
+        method,
+        account,
+        datetime.now().isoformat()
+    ))
 
-    bot.send_message(
-        ADMIN_ID,
-        f"🔔 New Withdrawal Request\n\n"
-        f"👤 User ID: {user_id}\n"
-        f"💰 Amount: {amount} USDT\n"
-        f"💳 Method: {method_name}\n"
-        f"📱 Account: {account}"
+    withdrawal_id = cur.lastrowid
+
+    con.commit()
+    con.close()
+
+    await update.message.reply_text(
+        f"""
+╭━━━━━━━━━━━━━━━━━━━━╮
+    ✅ WITHDRAWAL SENT
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+🆔 Request:
+#{withdrawal_id}
+
+💰 Amount:
+{amount:.2f} USDT
+
+💳 Method:
+{method}
+
+📱 Account:
+{account}
+
+⏳ Status:
+Pending
+
+Admin will process your request.
+"""
     )
 
-except Exception as e:
-    print("Admin notification error:", e)
+    # Notify admin
+    if ADMIN_ID:
 
-=========================
+        try:
 
-ADMIN
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Approve",
+                        callback_data=f"approve_{withdrawal_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Reject",
+                        callback_data=f"reject_{withdrawal_id}"
+                    )
+                ]
+            ])
 
-=========================
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"""
+🔔 NEW WITHDRAWAL
 
-@bot.message_handler(commands=["admin"])
-def admin_panel(message):
+🆔 Request:
+#{withdrawal_id}
 
-if message.from_user.id != ADMIN_ID:
+👤 User:
+{user.id}
 
-    bot.send_message(
-        message.chat.id,
-        "❌ আপনি Admin নন।"
+💰 Amount:
+{amount:.2f} USDT
+
+💳 Method:
+{method}
+
+📱 Account:
+{account}
+
+⏳ Status:
+PENDING
+""",
+                reply_markup=keyboard
+            )
+
+        except Exception as e:
+            logging.error(
+                f"Admin notification failed: {e}"
+            )
+
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+async def wd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "❌ Withdrawal cancelled."
     )
 
-    return
+    return ConversationHandler.END
 
-bot.send_message(
-    message.chat.id,
-    "👑 Admin Panel\n\n"
-    "বর্তমানে Admin panel-এর basic structure ready.\n"
-    "পরের ধাপে Task Add/Delete এবং Withdrawal Approve/Reject যোগ করব।"
-)
 
-=========================
+# =========================================================
+# ADMIN
+# =========================================================
 
-RUN BOT
+def is_admin(user_id):
+    return user_id == ADMIN_ID
 
-=========================
 
-print("Bot is running...")
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-bot.infinity_polling(
-skip_pending=True
-)
+    if not is_admin(update.effective_user.id):
+
+        await update.message.reply_text(
+            "⛔ Admin access only."
+        )
+
+        return
+
+    await update.message.reply_text(
+        """
+╭━━━━━━━━━━━━━━━━━━━━╮
+        👑 ADMIN PANEL
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+Welcome Admin!
+
+Manage your bot below.
+""",
+        reply_markup=admin_keyboard()
+    )
+
+
+# =========================================================
+# ADMIN STATS
+# =========================================================
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    users = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COALESCE(SUM(referrals),0) FROM users"
+    )
+    referrals = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COALESCE(SUM(balance),0) FROM users"
+    )
+    total_balance = float(cur.fetchone()[0])
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM withdrawals
+        WHERE status='pending'
+    """)
+
+    pending = cur.fetchone()[0]
+
+    con.close()
+
+    await update.message.reply_text(
+        f"""
+📊 BOT STATISTICS
+
+👥 Users:
+{users}
+
+🔗 Referrals:
+{referrals}
+
+💰 User Balance:
+{total_balance:.2f} USDT
+
+💳 Pending Withdrawals:
+{pending}
+
+🎁 Reward:
+{REFERRAL_REWARD:.2f} USDT
+
+📌 Minimum Withdraw:
+{MIN_WITHDRAW:.2f} USDT
+"""
+    )
+
+
+# =========================================================
+# ADMIN WITHDRAWALS
+# =========================================================
+
+async def withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT id, user_id, amount, method, account
+        FROM withdrawals
+        WHERE status='pending'
+        ORDER BY id DESC
+        LIMIT 30
+    """)
+
+    rows = cur.fetchall()
+    con.close()
+
+    if not rows:
+
+        await update.message.reply_text(
+            "✅ No pending withdrawals."
+        )
+
+        return
+
+    for row in rows:
+
+        wid, uid, amount, method, account = row
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "✅ Approve",
+                    callback_data=f"approve_{wid}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Reject",
+                    callback_data=f"reject_{wid}"
+                )
+            ]
+        ])
+
+        await update.message.reply_text(
+            f"""
+💳 WITHDRAWAL #{wid}
+
+👤 User:
+{uid}
+
+💰 Amount:
+{amount:.2f} USDT
+
+💳 Method:
+{method}
+
+📱 Account:
+{account}
+
+⏳ Pending
+""",
+            reply_markup=keyboard
+        )
+
+
+# =========================================================
+# CALLBACKS
+# =========================================================
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+
+    # -----------------------------------------------------
+    # USER
+    # -----------------------------------------------------
+
+    if data == "referral":
+
+        me = await context.bot.get_me()
+
+        link = (
+            f"https://t.me/{me.username}"
+            f"?start={user_id}"
+        )
+
+        row = get_user(user_id)
+
+        balance_amount = float(row[3])
+        referrals = row[4]
+
+        await query.message.reply_text(
+            f"""
+🔗 YOUR REFERRAL
+
+{link}
+
+👥 Referrals:
+{referrals}
+
+💰 Balance:
+{balance_amount:.2f} USDT
+
+🎁 Reward:
+{REFERRAL_REWARD:.2f} USDT/referral
+"""
+        )
+
+    elif data == "balance":
+
+        row = get_user(user_id)
+
+        await query.message.reply_text(
+            f"""
+💰 BALANCE
+
+{float(row[3]):.2f} USDT
+
+👥 Referrals:
+{row[4]}
+"""
+        )
+
+    elif data == "profile":
+
+        row = get_user(user_id)
+
+        await query.message.reply_text(
+            f"""
+👤 PROFILE
+
+🆔 ID: {user_id}
+
+👤 Name:
+{row[2]}
+
+👥 Referrals:
+{row[4]}
+
+💰 Balance:
+{float(row[3]):.2f} USDT
+"""
+        )
+
+    elif data == "leaderboard":
+
+        con = db()
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT first_name, referrals
+            FROM users
+            ORDER BY referrals DESC
+            LIMIT 10
+        """)
+
+        rows = cur.fetchall()
+        con.close()
+
+        text = "🏆 LEADERBOARD\n\n"
+
+        for i, row in enumerate(rows, 1):
+
+            text += (
+                f"{i}. {row[0]} — "
+                f"{row[1]} referrals\n"
+            )
+
+        await query.message.reply_text(text)
+
+    elif data == "withdraw":
+
+        row = get_user(user_id)
+
+        balance_amount = float(row[3])
+
+        if balance_amount < MIN_WITHDRAW:
+
+            await query.message.reply_text(
+                f"""
+❌ Not enough balance.
+
+💰 Balance:
+{balance_amount:.2f} USDT
+
+📌 Minimum:
+{MIN_WITHDRAW:.2f} USDT
+"""
+            )
+
+            return
+
+        await query.message.reply_text(
+            "Use /withdraw to start withdrawal."
+        )
+
+    elif data == "help":
+
+        await query.message.reply_text(
+            f"""
+ℹ️ HELP
+
+🎁 Referral:
+{REFERRAL_REWARD:.2f} USDT
+
+💳 Minimum Withdrawal:
+{MIN_WITHDRAW:.2f} USDT
+
+💳 Methods:
+bKash / Binance
+"""
+        )
+
+    # -----------------------------------------------------
+    # ADMIN
+    # -----------------------------------------------------
+
+    elif data == "admin_stats":
+
+        if is_admin(user_id):
+            await stats(update, context)
+
+    elif data == "admin_withdrawals":
+
+        if is_admin(user_id):
+            await withdrawals(update, context)
+
+    # -----------------------------------------------------
+    # APPROVE
+    # -----------------------------------------------------
+
+    elif data.startswith("approve_"):
+
+        if not is_admin(user_id):
+            return
+
+        wid = int(data.split("_")[1])
+
+        con = db()
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT user_id, amount, status
+            FROM withdrawals
+            WHERE id=?
+        """, (wid,))
+
+        row = cur.fetchone()
+
+        if not row:
+
+            con.close()
+
+            await query.edit_message_text(
+                "❌ Withdrawal not found."
+            )
+
+            return
+
+        target_user, amount, status = row
+
+        if status != "pending":
+
+            con.close()
+
+            await query.edit_message_text(
+                f"⚠️ Request #{wid} already processed."
+            )
+
+            return
+
+        cur.execute("""
+            UPDATE withdrawals
+            SET status='approved'
+            WHERE id=?
+        """, (wid,))
+
+        con.commit()
+        con.close()
+
+        await query.edit_message_text(
+            f"""
+✅ WITHDRAWAL APPROVED
+
+Request: #{wid}
+Amount: {amount:.2f} USDT
+
+Please send the payment manually.
+"""
+        )
+
+        try:
+
+            await context.bot.send_message(
+                target_user,
+                f"""
+✅ YOUR WITHDRAWAL WAS APPROVED
+
+🆔 Request:
+#{wid}
+
+💰 Amount:
+{amount:.2f} USDT
+
+Your payment has been approved by admin.
+"""
+            )
+
+        except Exception as e:
+            logging.error(e)
+
+    # -----------------------------------------------------
+    # REJECT
+    # -----------------------------------------------------
+
+    elif data.startswith("reject_"):
+
+        if not is_admin(user_id):
+            return
+
+        wid = int(data.split("_")[1])
+
+        con = db()
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT user_id, amount, status
+            FROM withdrawals
+            WHERE id=?
+        """, (wid,))
+
+        row = cur.fetchone()
+
+        if not row:
+
+            con.close()
+
+            await query.edit_message_text(
+                "❌ Withdrawal not found."
+            )
+
+            return
+
+        target_user, amount, status = row
+
+        if status != "pending":
+
+            con.close()
+
+            await query.edit_message_text(
+                f"⚠️ Request #{wid} already processed."
+            )
+
+            return
+
+        # Refund amount
+        cur.execute("""
+            UPDATE users
+            SET balance = balance + ?
+            WHERE user_id=?
+        """, (
+            amount,
+            target_user
+        ))
+
+        cur.execute("""
+            UPDATE withdrawals
+            SET status='rejected'
+            WHERE id=?
+        """, (wid,))
+
+        con.commit()
+        con.close()
+
+        await query.edit_message_text(
+            f"""
+❌ WITHDRAWAL REJECTED
+
+Request: #{wid}
+
+💰 {amount:.2f} USDT
+was refunded to the user.
+"""
+        )
+
+        try:
+
+            await context.bot.send_message(
+                target_user,
+                f"""
+❌ WITHDRAWAL REJECTED
+
+🆔 Request:
+#{wid}
+
+💰 Amount:
+{amount:.2f} USDT
+
+The amount has been returned to your balance.
+"""
+            )
+
+        except Exception as e:
+            logging.error(e)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    init_db()
+
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # Basic commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("referral", referral))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("help", help_command))
+
+    # Admin
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(
+        CommandHandler("withdrawals", withdrawals)
+    )
+
+    # Withdrawal conversation
+    withdrawal_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("withdraw", withdraw)
+        ],
+
+        states={
+
+            WD_AMOUNT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    wd_amount
+                )
+            ],
+
+            WD_METHOD: [
+                CallbackQueryHandler(
+                    wd_method,
+                    pattern="^wd_method_"
+                )
+            ],
+
+            WD_ACCOUNT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    wd_account
+                )
+            ],
+        },
+
+        fallbacks=[
+            CommandHandler("cancel", wd_cancel)
+        ],
+
+        allow_reentry=True
+    )
+
+    app.add_handler(withdrawal_handler)
+
+    # Inline buttons
+    app.add_handler(
+        CallbackQueryHandler(callbacks)
+    )
+
+    print("🚀 Referral Bot Started!")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
