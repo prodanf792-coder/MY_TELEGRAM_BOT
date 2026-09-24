@@ -4,7 +4,7 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN8970288617:AAGkr6tzwlDInmKoSvO1TnefZqucskF7dMY)
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_NAME = "referral_bot.db"
 
